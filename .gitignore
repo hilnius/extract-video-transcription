@@ -1,41 +1,32 @@
-# Python
-*.py[cod]
+
+# Python virtual environments
+bin/
+lib/
+lib64
+share/
+include/
+pyvenv.cfg
+
+# Python specific
 __pycache__/
-*.py[cod]/
+*.py[cod]
+*$py.class
 
-# Virtual environment
-venv/
-.env/
-.venv/
-
-# IDE specific
-.idea/
-.vscode/
-*.swp
-
-# Data and logs
-data/
-logs/
-*.log
+# Environments
+.env
 
 # Temporary files
 temp_audio_channels/
-temp*/
-*.tmp
-*.bak
 
 # Output files
 *_transcription.txt
 *.wav
 
-# System files
-.DS_Store
-Thumbs.db
-
-# Python package files
-*.egg-info/
-dist/
-build/
-
-# Jupyter notebooks
-.ipynb_checkpoints/
+# Input video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.wmv
