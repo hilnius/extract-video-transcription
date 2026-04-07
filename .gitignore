@@ -1,0 +1,41 @@
+# Python
+*.py[cod]
+__pycache__/
+*.py[cod]/
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+
+# Data and logs
+data/
+logs/
+*.log
+
+# Temporary files
+temp_audio_channels/
+temp*/
+*.tmp
+*.bak
+
+# Output files
+*_transcription.txt
+*.wav
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Python package files
+*.egg-info/
+dist/
+build/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
