@@ -1,23 +1,24 @@
 # Video Call Transcription Tool
 
-A collection of scripts to transcribe video calls with speaker separation and timestamps using LLM-based speech recognition.
+Transcribes video calls with speaker separation and real timestamps using Mistral's Voxtral model and Silero VAD.
 
 ## Features
 
-- Extract audio channels from video files (stereo and mono)
-- Transcribe each audio channel separately using Mistral's Voxtral model
-- Include timestamps for each spoken phrase/sentence
-- Output formatted text with speaker identification
-- Support for multiple video formats (MP4, AVI, MOV, etc.)
-- LLM-based transcription with chunked processing to avoid GPU memory issues
-- Debug mode to preserve intermediate audio files for verification
-- Automatic GPU detection with CPU warning
+- Extracts audio channels from video files (stereo and mono)
+- **Voice Activity Detection** (Silero VAD) to skip silence and avoid hallucinated text
+- **Real timestamps** based on actual speech timing (not approximations)
+- **Conversation-ordered output** — both speakers interleaved chronologically, not grouped by channel
+- Customizable speaker names via environment variable
+- 4-bit quantized model to fit on 8GB VRAM GPUs
+- Chunked processing to avoid GPU memory issues
+- Debug mode to preserve intermediate audio files
 
 ## Requirements
 
 - FFmpeg (for audio extraction)
 - Python 3.8+
-- Required Python packages:
+- GPU with at least 8GB VRAM (CPU fallback available but slow)
+- Python packages:
   - `transformers` (from HuggingFace)
   - `mistral-common[audio]>=1.8.1`
   - `bitsandbytes`
@@ -27,6 +28,8 @@ A collection of scripts to transcribe video calls with speaker separation and ti
   - `numpy`
   - `torch`
   - `soundfile`
+
+Silero VAD is downloaded automatically via `torch.hub` on first run.
 
 ## Installation
 
@@ -44,79 +47,61 @@ pip install git+https://github.com/huggingface/transformers mistral-common[audio
 # Basic usage
 python transcribe.py input_video.mp4
 
-# Debug mode (keeps intermediate audio files)
-# Set DEBUG_MODE = True in transcribe.py before running
+# With custom speaker names
+CHANNEL_NAMES="Alice,Bob" python transcribe.py input_video.mp4
+
+# With a different language (default: French)
+VOXTRAL_LANGUAGE=en python transcribe.py input_video.mp4
 ```
+
+Output is written to `<video_name>_transcription.txt` in the current directory.
 
 ### Output Format
 
-The script generates a text file with sentence-level timestamps:
+The output is a chronological conversation with real timestamps:
 
 ```
-[Channel 1]
-  [00:00:05] Hello everyone, welcome to the meeting.
-  [00:00:12] Today we'll be discussing the project timeline.
-  [00:00:18] Let's get started with the first topic.
+[00:00:02] Speaker 1: Hello everyone, welcome to the meeting. Today we'll be discussing the project timeline.
 
-[Channel 2]
-  [00:00:22] Thanks for organizing this.
-  [00:00:28] I have some questions about the schedule.
+[00:00:15] Speaker 2: Thanks for organizing this. I have some questions about the schedule.
+
+[00:00:28] Speaker 1: Sure, go ahead.
 ```
+
+Consecutive sentences from the same speaker are grouped into paragraphs.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `VOXTRAL_LANGUAGE` | `fr` | Transcription language |
+| `CHANNEL_NAMES` | (none) | Comma-separated speaker names, e.g. `"Alice,Bob"` |
 
 ## How It Works
 
-1. **Audio Extraction**: Uses FFmpeg to extract stereo audio and split into separate channels
-2. **Chunked Processing**: Processes audio in 25-second chunks to avoid GPU memory issues
-3. **LLM Transcription**: Uses Mistral's Voxtral-Mini-3B-2507 model with 4-bit quantization
-4. **Timestamp Generation**: Calculates approximate timestamps for each sentence
-5. **Formatting**: Combines all channels into structured output with sentence-level timestamps
+1. **Audio Extraction**: FFmpeg extracts stereo audio and splits into separate mono channels (with fallbacks for different audio layouts)
+2. **Voice Activity Detection**: Silero VAD detects speech segments in each channel, providing real start/end timestamps and skipping silence
+3. **Chunked Transcription**: Speech segments are grouped into chunks of up to 25 seconds and sent to Voxtral-Mini-3B-2507 (4-bit quantized)
+4. **Chronological Merge**: All transcribed segments from both channels are sorted by timestamp and grouped by speaker, producing a conversation-ordered output
 
 ## Model Details
 
 - **Model**: mistralai/Voxtral-Mini-3B-2507
-- **Quantization**: 4-bit (NF4) to fit on 8GB VRAM GPUs
+- **Quantization**: 4-bit NF4 with double quantization
+- **VAD**: Silero VAD (via torch.hub, snakers4/silero-vad)
 - **Sample Rate**: 16 kHz (automatically resampled)
-- **Language**: Configurable via `VOXTRAL_LANGUAGE` environment variable (default: French)
-- **Chunk Size**: 25 seconds (configurable for memory constraints)
-
-## Key Features
-
-- **Memory Management**: Automatic GPU cache clearing and chunked processing
-- **Error Handling**: Robust FFmpeg audio extraction with multiple fallback methods
-- **Progress Tracking**: Detailed progress output for each processing step
-- **Debug Mode**: Option to preserve intermediate files for verification
-- **GPU Detection**: Automatic GPU usage detection with CPU warnings
-
-## Limitations
-
-- Requires GPU with at least 8GB VRAM for optimal performance
-- Accuracy depends on audio quality and background noise
-- May not work well with overlapping speech
-- Currently optimized for French (configurable for other languages)
-- Timestamp precision is approximate (sentence-level, not word-level)
-
-## Future Enhancements
-
-- Speaker diarization for better channel identification
-- Support for multiple languages with automatic detection
-- Noise reduction preprocessing
-- Batch processing for multiple video files
-- Real-time transcription mode
-- Word-level timestamp precision
-- Automatic language detection
+- **Max chunk size**: 25 seconds
 
 ## Debug Mode
 
-Set `DEBUG_MODE = True` in `transcribe.py` to:
-- Keep intermediate stereo audio files
-- Preserve individual channel WAV files
-- Maintain temporary directory structure
-- Get detailed file paths for verification
+Set `DEBUG_MODE = True` in `transcribe.py` (enabled by default) to preserve:
+- Intermediate stereo audio file
+- Individual channel WAV files
+- Temporary directory structure
 
-## License
+## Limitations
 
-MIT License - see LICENSE file for details
-
-## License
-
-MIT License - see LICENSE file for details
+- Requires GPU with at least 8GB VRAM for reasonable performance
+- Accuracy depends on audio quality and background noise
+- Overlapping speech may be attributed to the wrong speaker
+- Timestamp precision is at the VAD segment level, not word-level

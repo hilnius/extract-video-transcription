@@ -5,6 +5,10 @@ Video call transcription using Mistral's Voxtral model.
 Extracts audio channels from video files, transcribes each channel separately
 using Voxtral-Mini-3B-2507 with timestamps, and outputs formatted text.
 
+Uses Silero VAD to detect speech segments before transcription, which:
+- Avoids hallucinated text on silent segments
+- Provides accurate real timestamps for each utterance
+
 Requires:
   pip install git+https://github.com/huggingface/transformers
   pip install mistral-common[audio]>=1.8.1
@@ -170,39 +174,102 @@ def extract_audio_channels(video_path, output_dir):
     return channel_files
 
 
+def detect_speech_segments(audio_np, sample_rate, min_speech_duration=0.5, min_silence_duration=0.8, merge_gap=1.0):
+    """Use Silero VAD to detect speech segments in audio.
+
+    Returns list of (start_sec, end_sec) tuples for each speech segment.
+    Adjacent segments closer than merge_gap seconds are merged.
+    """
+    print("  Running Voice Activity Detection (Silero VAD)...")
+
+    # Load Silero VAD model
+    vad_model, vad_utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        trust_repo=True,
+    )
+    (get_speech_timestamps, _, _, _, _) = vad_utils
+
+    # Silero VAD expects 16kHz mono float32 tensor
+    audio_tensor = torch.from_numpy(audio_np).float()
+
+    # Get speech timestamps (in samples)
+    speech_timestamps = get_speech_timestamps(
+        audio_tensor,
+        vad_model,
+        sampling_rate=sample_rate,
+        min_speech_duration_ms=int(min_speech_duration * 1000),
+        min_silence_duration_ms=int(min_silence_duration * 1000),
+        threshold=0.5,
+    )
+
+    if not speech_timestamps:
+        print("  No speech detected in audio.")
+        return []
+
+    # Convert to seconds
+    segments = [
+        (ts['start'] / sample_rate, ts['end'] / sample_rate)
+        for ts in speech_timestamps
+    ]
+
+    # Merge segments that are close together (within merge_gap)
+    merged = [segments[0]]
+    for start, end in segments[1:]:
+        if start - merged[-1][1] <= merge_gap:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+
+    total_speech = sum(end - start for start, end in merged)
+    total_duration = len(audio_np) / sample_rate
+    print(f"  VAD found {len(merged)} speech segments ({total_speech:.1f}s speech / {total_duration:.1f}s total)")
+
+    return merged
+
+
 def transcribe_audio_chunked(model, processor, audio_path, channel_index):
-    """Transcribe a single audio file using Voxtral with chunked processing to avoid OOM."""
+    """Transcribe a single audio file using Voxtral, only on speech segments detected by VAD.
+
+    Returns a list of (start_sec, text) tuples with real timestamps.
+    """
     print(f"\n{'='*50}")
     print(f"Processing Channel {channel_index}")
     print(f"{'='*50}")
-    
+
     try:
         # Load and validate audio file
         audio_np, sample_rate = sf.read(audio_path)
         duration = len(audio_np) / sample_rate
-        
+
         print(f"Audio validation:")
         print(f"  Duration: {duration:.2f} seconds")
         print(f"  Sample rate: {sample_rate} Hz")
         print(f"  Channels: {audio_np.shape[0] if len(audio_np.shape) > 1 else 1}")
         print(f"  Samples: {len(audio_np)}")
-        
+
         # Convert to mono if needed
         if len(audio_np.shape) > 1:
             audio_np = audio_np.mean(axis=1)
             print(f"  Converted to mono")
-        
+
         # Resample to 16 kHz if needed
         if sample_rate != VOXTRAL_SAMPLE_RATE:
             print(f"  Resampling from {sample_rate} Hz to {VOXTRAL_SAMPLE_RATE} Hz...")
             audio_np = resample_audio(audio_np, sample_rate, VOXTRAL_SAMPLE_RATE)
             print(f"  Resampling complete")
 
+        # Detect speech segments with VAD
+        speech_segments = detect_speech_segments(audio_np, VOXTRAL_SAMPLE_RATE)
+
+        if not speech_segments:
+            print("  No speech found, skipping channel.")
+            return []
+
         # Check GPU usage
         device = model.device
         if device.type == 'cuda':
             print(f"  Using GPU: {torch.cuda.get_device_name(0)}")
-            # Clear GPU cache before processing
             torch.cuda.empty_cache()
         else:
             print(f"\n{'!'*50}")
@@ -210,31 +277,42 @@ def transcribe_audio_chunked(model, processor, audio_path, channel_index):
             print(f"  Consider using a GPU for faster transcription.")
             print(f"{'!'*50}\n")
 
-        # Process audio in chunks to avoid OOM errors
-        # Voxtral can handle up to ~30 seconds comfortably on 8GB GPU
-        chunk_size_seconds = 25  # Conservative chunk size
-        chunk_samples = int(chunk_size_seconds * VOXTRAL_SAMPLE_RATE)
-        
-        print(f"  Processing in chunks of {chunk_size_seconds} seconds...")
-        
-        full_transcription = []
-        total_chunks = int(np.ceil(len(audio_np) / chunk_samples))
-        
-        for chunk_idx in range(total_chunks):
-            start_sample = chunk_idx * chunk_samples
-            end_sample = min((chunk_idx + 1) * chunk_samples, len(audio_np))
+        # Transcribe each speech segment (or groups of segments up to ~25s)
+        MAX_CHUNK_SECONDS = 25
+        timestamped_transcriptions = []  # list of (start_sec, text)
+
+        # Group adjacent speech segments into chunks that fit within MAX_CHUNK_SECONDS
+        chunks = []  # list of (start_sec, end_sec)
+        current_chunk_start = speech_segments[0][0]
+        current_chunk_end = speech_segments[0][1]
+
+        for seg_start, seg_end in speech_segments[1:]:
+            if seg_end - current_chunk_start <= MAX_CHUNK_SECONDS:
+                # Extend current chunk to include this segment
+                current_chunk_end = seg_end
+            else:
+                # Save current chunk and start a new one
+                chunks.append((current_chunk_start, current_chunk_end))
+                current_chunk_start = seg_start
+                current_chunk_end = seg_end
+        chunks.append((current_chunk_start, current_chunk_end))
+
+        print(f"  Transcribing {len(chunks)} chunks from {len(speech_segments)} speech segments...")
+
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+            start_sample = int(chunk_start * VOXTRAL_SAMPLE_RATE)
+            end_sample = int(chunk_end * VOXTRAL_SAMPLE_RATE)
             chunk_audio = audio_np[start_sample:end_sample]
-            
+
             chunk_duration = len(chunk_audio) / VOXTRAL_SAMPLE_RATE
-            print(f"  Processing chunk {chunk_idx + 1}/{total_chunks} ({chunk_duration:.1f}s)...")
-            
+            print(f"  Chunk {chunk_idx + 1}/{len(chunks)} [{format_timestamp(chunk_start)}-{format_timestamp(chunk_end)}] ({chunk_duration:.1f}s)...")
+
             # Save chunk to temporary file
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
                 sf.write(tmp_path, chunk_audio, VOXTRAL_SAMPLE_RATE)
 
             try:
-                # Transcribe this chunk
                 inputs = processor.apply_transcription_request(
                     language=LANGUAGE,
                     audio=tmp_path,
@@ -247,46 +325,39 @@ def transcribe_audio_chunked(model, processor, audio_path, channel_index):
                     outputs = model.generate(**inputs, max_new_tokens=440, temperature=0.0, do_sample=False)
                     elapsed = time.perf_counter() - start
 
-                # Decode only the generated tokens
                 response_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-                chunk_text = processor.batch_decode([response_tokens], skip_special_tokens=True)[0]
-                full_transcription.append(chunk_text)
-                
+                chunk_text = processor.batch_decode([response_tokens], skip_special_tokens=True)[0].strip()
+
+                if chunk_text:
+                    timestamped_transcriptions.append((chunk_start, chunk_text))
+
                 num_tokens = len(response_tokens)
                 tok_per_sec = num_tokens / elapsed if elapsed > 0 else 0
-                print(f"    Chunk {chunk_idx + 1}: {num_tokens} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)")
-                
+                print(f"    {num_tokens} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)")
+
             except Exception as e:
                 print(f"    Error processing chunk {chunk_idx + 1}: {e}")
-                full_transcription.append(f"[Error in chunk {chunk_idx + 1}]")
             finally:
-                # Clean up temporary file
                 try:
                     os.unlink(tmp_path)
                 except:
                     pass
 
-        # Combine all chunks
-        full_text = " ".join(full_transcription)
-        
-        # Calculate overall metrics
-        total_time = sum(len(chunk.split()) for chunk in full_transcription if chunk.strip())
-        words_per_min = (total_time / duration) * 60 if duration > 0 else 0
-        
+        total_words = sum(len(t.split()) for _, t in timestamped_transcriptions)
+        total_speech = sum(e - s for s, e in speech_segments)
         print(f"\nTranscription Results:")
         print(f"  Total duration: {duration:.2f} seconds")
-        print(f"  Processed chunks: {total_chunks}")
-        print(f"  Estimated words: {total_time}")
-        print(f"  Overall speed: {words_per_min:.0f} words/minute")
-        print(f"  Real-time factor: {(duration/duration):.2f}x")  # Will be 1.0x since we process sequentially
-        
-        return full_text
-        
+        print(f"  Speech duration: {total_speech:.2f} seconds")
+        print(f"  Segments transcribed: {len(timestamped_transcriptions)}")
+        print(f"  Estimated words: {total_words}")
+
+        return timestamped_transcriptions
+
     except Exception as e:
         print(f"Error transcribing channel {channel_index}: {e}")
         import traceback
         traceback.print_exc()
-        return f"[Error transcribing channel {channel_index}]"
+        return []
 
 
 def format_timestamp(seconds):
@@ -300,63 +371,71 @@ def format_timestamp(seconds):
 def process_video(video_path, output_file):
     """Main processing function for video transcription."""
     print(f"Processing video: {video_path}")
-    
+
     # Create temporary directory for audio channels
     temp_dir = "temp_audio_channels"
-    
+
     # Extract audio channels
     channel_files = extract_audio_channels(video_path, temp_dir)
-    
+
     if not channel_files:
         print("No audio channels extracted. Exiting.")
         return
-    
+
     # Initialize model
     model, processor = initialize_model()
-    
-    # Transcribe each channel
+
+    # Transcribe each channel - now returns list of (timestamp_sec, text) tuples
     transcriptions = []
     for i, channel_file in enumerate(channel_files):
-        transcription = transcribe_audio_chunked(model, processor, channel_file, i)
-        transcriptions.append((i, transcription))
-    
-    # Write output file with proper timestamp handling
+        segments = transcribe_audio_chunked(model, processor, channel_file, i)
+        transcriptions.append((i, segments))
+
+    # Build a single list of all sentences with real timestamps and speaker labels,
+    # then sort by time so the output reads like a conversation.
+    # Channel names can be customized via environment variable, e.g. CHANNEL_NAMES="Alice,Bob"
+    channel_names_env = os.getenv("CHANNEL_NAMES", "")
+    channel_names = [n.strip() for n in channel_names_env.split(",") if n.strip()] if channel_names_env else []
+
+    all_lines = []  # list of (timestamp_sec, speaker_label, sentence_text)
+    for channel_index, segments in transcriptions:
+        if channel_index < len(channel_names):
+            speaker = channel_names[channel_index]
+        else:
+            speaker = f"Speaker {channel_index + 1}"
+
+        for seg_idx, (timestamp_sec, text) in enumerate(segments):
+            # Determine the time span for this segment
+            if seg_idx + 1 < len(segments):
+                next_ts = segments[seg_idx + 1][0]
+            else:
+                next_ts = timestamp_sec + 30  # assume ~30s for last segment
+
+            sentences = [s.strip().rstrip('.') for s in text.split('. ') if s.strip()]
+            if not sentences:
+                continue
+
+            seg_duration = next_ts - timestamp_sec
+            for i, sentence in enumerate(sentences):
+                sentence_ts = timestamp_sec + (i / len(sentences)) * seg_duration
+                all_lines.append((sentence_ts, speaker, sentence))
+
+    # Sort all lines by timestamp to produce a chronological conversation
+    all_lines.sort(key=lambda x: x[0])
+
+    # Group consecutive lines from the same speaker into paragraphs
+    paragraphs = []
+    for ts, speaker, sentence in all_lines:
+        if paragraphs and paragraphs[-1][1] == speaker:
+            paragraphs[-1] = (paragraphs[-1][0], speaker, paragraphs[-1][2] + " " + sentence + ".")
+        else:
+            paragraphs.append((ts, speaker, sentence + "."))
+
     print(f"Writing output to {output_file}")
     with open(output_file, 'w', encoding='utf-8') as f:
-        for channel_index, transcription in transcriptions:
-            # Split transcription into sentences/phrases for better timestamp handling
-            # This is a simple approach - in production you'd want more sophisticated
-            # sentence splitting and actual timestamp alignment
-            
-            # Split by sentences (simple approach)
-            sentences = transcription.split('. ')
-            
-            # Calculate approximate timestamps for each sentence
-            # This assumes equal time distribution - real implementation would
-            # use the actual audio timing
-            if sentences:
-                f.write(f"[Channel {channel_index + 1}]\n")
-                
-                # Get the audio file to determine duration
-                audio_path = os.path.join(temp_dir, f"channel_{channel_index}.wav")
-                if os.path.exists(audio_path):
-                    audio_np, sample_rate = sf.read(audio_path)
-                    total_duration = len(audio_np) / sample_rate
-                    sentences_per_second = len(sentences) / total_duration if total_duration > 0 else 1
-                else:
-                    sentences_per_second = 1
-                    total_duration = len(sentences)  # fallback
-                
-                # Write each sentence with approximate timestamp
-                for i, sentence in enumerate(sentences):
-                    if sentence.strip():
-                        # Approximate timestamp (simple linear distribution)
-                        timestamp_seconds = (i / sentences_per_second) if sentences_per_second > 0 else 0
-                        f.write(f"  {format_timestamp(timestamp_seconds)} {sentence.strip()}.\n")
-                f.write("\n")
-            else:
-                f.write(f"[Channel {channel_index + 1}] {format_timestamp(0)} {transcription}\n\n")
-    
+        for ts, speaker, text in paragraphs:
+            f.write(f"{format_timestamp(ts)} {speaker}: {text}\n\n")
+
     # Clean up temporary files (unless in debug mode)
     if not DEBUG_MODE:
         for channel_file in channel_files:
@@ -364,7 +443,7 @@ def process_video(video_path, output_file):
                 os.remove(channel_file)
             except:
                 pass
-        
+
         try:
             os.rmdir(temp_dir)
         except:
@@ -374,7 +453,7 @@ def process_video(video_path, output_file):
         print(f"DEBUG: Channel files preserved:")
         for i, channel_file in enumerate(channel_files):
             print(f"  Channel {i}: {channel_file}")
-    
+
     print(f"Transcription complete. Output saved to {output_file}")
 
 
